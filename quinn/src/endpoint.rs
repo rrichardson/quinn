@@ -22,8 +22,10 @@ use tokio::sync::{mpsc, Notify};
 use udp::{RecvMeta, UdpState, BATCH_SIZE};
 
 use crate::{
-    connection::Connecting, poll_fn, work_limiter::WorkLimiter, ConnectionEvent, EndpointConfig,
-    EndpointEvent, VarInt, IO_LOOP_BOUND, RECV_TIME_BOUND, SEND_TIME_BOUND,
+    connection::{Connecting, ConnectionRef},
+    poll_fn,
+    work_limiter::WorkLimiter,
+    EndpointConfig, EndpointEvent, VarInt, IO_LOOP_BOUND, RECV_TIME_BOUND, SEND_TIME_BOUND,
 };
 
 /// A QUIC endpoint.
@@ -202,9 +204,10 @@ impl Endpoint {
         inner.ipv6 = addr.is_ipv6();
 
         // Generate some activity so peers notice the rebind
-        for sender in inner.connections.senders.values() {
-            // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::Ping);
+        for conn in inner.connections.refs.values() {
+            let mut state = conn.state.lock("ping");
+            state.inner.ping();
+            state.wake();
         }
 
         Ok(())
@@ -235,12 +238,9 @@ impl Endpoint {
         let reason = Bytes::copy_from_slice(reason);
         let mut endpoint = self.inner.lock().unwrap();
         endpoint.connections.close = Some((error_code, reason.clone()));
-        for sender in endpoint.connections.senders.values() {
-            // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::Close {
-                error_code,
-                reason: reason.clone(),
-            });
+        for conn in endpoint.connections.refs.values() {
+            let mut state = conn.state.lock("close");
+            state.close(error_code, reason.clone(), &conn.shared);
         }
         if let Some(task) = endpoint.incoming_reader.take() {
             task.wake();
@@ -338,9 +338,6 @@ impl Drop for EndpointDriver {
         if let Some(task) = endpoint.incoming_reader.take() {
             task.wake();
         }
-        // Drop all outgoing channels, signaling the termination of the endpoint to the associated
-        // connections.
-        endpoint.connections.senders.clear();
     }
 }
 
@@ -403,13 +400,10 @@ impl EndpointInner {
                                     self.incoming.push_back(conn);
                                 }
                                 Some((handle, DatagramEvent::ConnectionEvent(event))) => {
-                                    // Ignoring errors from dropped connections that haven't yet been cleaned up
-                                    let _ = self
-                                        .connections
-                                        .senders
-                                        .get_mut(&handle)
-                                        .unwrap()
-                                        .send(ConnectionEvent::Proto(event));
+                                    let conn = self.connections.refs.get(&handle).unwrap();
+                                    let mut state = conn.state.lock("handle_event");
+                                    state.inner.handle_event(event);
+                                    state.wake();
                                 }
                                 None => {}
                             }
@@ -488,19 +482,16 @@ impl EndpointInner {
                 Poll::Ready(Some((ch, event))) => match event {
                     Proto(e) => {
                         if e.is_drained() {
-                            self.connections.senders.remove(&ch);
+                            self.connections.refs.remove(&ch);
                             if self.connections.is_empty() {
                                 self.idle.notify_waiters();
                             }
                         }
                         if let Some(event) = self.inner.handle_event(ch, e) {
-                            // Ignoring errors from dropped connections that haven't yet been cleaned up
-                            let _ = self
-                                .connections
-                                .senders
-                                .get_mut(&ch)
-                                .unwrap()
-                                .send(ConnectionEvent::Proto(event));
+                            let conn = self.connections.refs.get(&ch).unwrap();
+                            let mut conn = conn.state.lock("handle_event");
+                            conn.inner.handle_event(event);
+                            conn.wake();
                         }
                     }
                     Transmit(t) => self.outgoing.push_back(t),
@@ -518,8 +509,7 @@ impl EndpointInner {
 
 #[derive(Debug)]
 struct ConnectionSet {
-    /// Senders for communicating with the endpoint's connections
-    senders: FxHashMap<ConnectionHandle, mpsc::UnboundedSender<ConnectionEvent>>,
+    refs: FxHashMap<ConnectionHandle, ConnectionRef>,
     /// Stored to give out clones to new ConnectionInners
     sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
     /// Set if the endpoint has been manually closed
@@ -534,20 +524,17 @@ impl ConnectionSet {
         udp_state: Arc<UdpState>,
         runtime: Arc<dyn Runtime>,
     ) -> Connecting {
-        let (send, recv) = mpsc::unbounded_channel();
+        let (future, conn) = Connecting::new(handle, conn, self.sender.clone(), udp_state, runtime);
         if let Some((error_code, ref reason)) = self.close {
-            send.send(ConnectionEvent::Close {
-                error_code,
-                reason: reason.clone(),
-            })
-            .unwrap();
+            let mut state = conn.state.lock("close");
+            state.close(error_code, reason.clone(), &conn.shared);
         }
-        self.senders.insert(handle, send);
-        Connecting::new(handle, conn, self.sender.clone(), recv, udp_state, runtime)
+        self.refs.insert(handle, conn);
+        future
     }
 
     fn is_empty(&self) -> bool {
-        self.senders.is_empty()
+        self.refs.is_empty()
     }
 }
 
@@ -636,7 +623,7 @@ impl EndpointRef {
             incoming_reader: None,
             driver: None,
             connections: ConnectionSet {
-                senders: FxHashMap::default(),
+                refs: FxHashMap::default(),
                 sender,
                 close: None,
             },
