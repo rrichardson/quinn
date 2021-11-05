@@ -102,7 +102,7 @@ impl Connecting {
 
         if is_ok {
             let conn = self.conn.take().unwrap();
-            Ok((Connection(conn), ZeroRttAccepted(self.connected)))
+            Ok((Connection { conn }, ZeroRttAccepted(self.connected)))
         } else {
             Err(self)
         }
@@ -165,7 +165,7 @@ impl Future for Connecting {
             let inner = conn.state.lock("connecting");
             if inner.connected {
                 drop(inner);
-                Ok(Connection(conn))
+                Ok(Connection { conn })
             } else {
                 Err(inner
                     .error
@@ -258,7 +258,9 @@ impl Future for ConnectionDriver {
 ///
 /// [`Connection::close()`]: Connection::close
 #[derive(Debug, Clone)]
-pub struct Connection(ConnectionRef);
+pub struct Connection {
+    conn: ConnectionRef,
+}
 
 impl Connection {
     /// Initiate a new outgoing unidirectional stream.
@@ -268,8 +270,8 @@ impl Connection {
     /// actually used.
     pub fn open_uni(&self) -> OpenUni<'_> {
         OpenUni {
-            conn: &self.0,
-            notify: self.0.shared.stream_opening[Dir::Uni as usize].notified(),
+            conn: &self.conn,
+            notify: self.conn.shared.stream_opening[Dir::Uni as usize].notified(),
         }
     }
 
@@ -280,32 +282,32 @@ impl Connection {
     /// actually used.
     pub fn open_bi(&self) -> OpenBi<'_> {
         OpenBi {
-            conn: &self.0,
-            notify: self.0.shared.stream_opening[Dir::Bi as usize].notified(),
+            conn: &self.conn,
+            notify: self.conn.shared.stream_opening[Dir::Bi as usize].notified(),
         }
     }
 
     /// Accept the next incoming uni-directional stream
     pub fn accept_uni(&self) -> AcceptUni<'_> {
         AcceptUni {
-            conn: &self.0,
-            notify: self.0.shared.stream_incoming[Dir::Uni as usize].notified(),
+            conn: &self.conn,
+            notify: self.conn.shared.stream_incoming[Dir::Uni as usize].notified(),
         }
     }
 
     /// Accept the next incoming bidirectional stream
     pub fn accept_bi(&self) -> AcceptBi<'_> {
         AcceptBi {
-            conn: &self.0,
-            notify: self.0.shared.stream_incoming[Dir::Bi as usize].notified(),
+            conn: &self.conn,
+            notify: self.conn.shared.stream_incoming[Dir::Bi as usize].notified(),
         }
     }
 
     /// Receive an application datagram
     pub fn read_datagram(&self) -> ReadDatagram<'_> {
         ReadDatagram {
-            conn: self.0.clone(),
-            notify: self.0.shared.datagrams.notified(),
+            conn: self.conn.clone(),
+            notify: self.conn.shared.datagrams.notified(),
         }
     }
 
@@ -316,17 +318,17 @@ impl Connection {
     /// and [`ConnectionError::ApplicationClosed`].
     pub async fn closed(&self) -> ConnectionError {
         {
-            let conn = self.0.state.lock("closed");
+            let conn = self.conn.state.lock("closed");
             if let Some(error) = conn.error.as_ref() {
                 return error.clone();
             }
             // Construct the future while the lock is held to ensure we can't miss a wakeup if
             // the `Notify` is signaled immediately after we release the lock. `await` it after
             // the lock guard is out of scope.
-            self.0.shared.closed.notified()
+            self.conn.shared.closed.notified()
         }
         .await;
-        self.0
+        self.conn
             .state
             .lock("closed")
             .error
@@ -351,8 +353,12 @@ impl Connection {
     /// [`finish`]: crate::SendStream::finish
     /// [`SendStream`]: crate::SendStream
     pub fn close(&self, error_code: VarInt, reason: &[u8]) {
-        let conn = &mut *self.0.state.lock("close");
-        conn.close(error_code, Bytes::copy_from_slice(reason), &self.0.shared);
+        let conn = &mut *self.conn.state.lock("close");
+        conn.close(
+            error_code,
+            Bytes::copy_from_slice(reason),
+            &self.conn.shared,
+        );
     }
 
     /// Transmit `data` as an unreliable, unordered application datagram
@@ -361,7 +367,7 @@ impl Connection {
     /// and `data` must both fit inside a single QUIC packet and be smaller than the maximum
     /// dictated by the peer.
     pub fn send_datagram(&self, data: Bytes) -> Result<(), SendDatagramError> {
-        let conn = &mut *self.0.state.lock("send_datagram");
+        let conn = &mut *self.conn.state.lock("send_datagram");
         if let Some(ref x) = conn.error {
             return Err(SendDatagramError::ConnectionLost(x.clone()));
         }
@@ -391,7 +397,7 @@ impl Connection {
     ///
     /// [`send_datagram()`]: Connection::send_datagram
     pub fn max_datagram_size(&self) -> Option<usize> {
-        self.0
+        self.conn
             .state
             .lock("max_datagram_size")
             .inner
@@ -404,7 +410,11 @@ impl Connection {
     /// If `ServerConfig::migration` is `true`, clients may change addresses at will, e.g. when
     /// switching to a cellular internet connection.
     pub fn remote_address(&self) -> SocketAddr {
-        self.0.state.lock("remote_address").inner.remote_address()
+        self.conn
+            .state
+            .lock("remote_address")
+            .inner
+            .remote_address()
     }
 
     /// The local IP address which was used when the peer established
@@ -422,22 +432,22 @@ impl Connection {
     /// On all non-supported platforms the local IP address will not be available,
     /// and the method will return `None`.
     pub fn local_ip(&self) -> Option<IpAddr> {
-        self.0.state.lock("local_ip").inner.local_ip()
+        self.conn.state.lock("local_ip").inner.local_ip()
     }
 
     /// Current best estimate of this connection's latency (round-trip-time)
     pub fn rtt(&self) -> Duration {
-        self.0.state.lock("rtt").inner.rtt()
+        self.conn.state.lock("rtt").inner.rtt()
     }
 
     /// Returns connection statistics
     pub fn stats(&self) -> ConnectionStats {
-        self.0.state.lock("stats").inner.stats()
+        self.conn.state.lock("stats").inner.stats()
     }
 
     /// Current state of the congestion control algorithm, for debugging purposes
     pub fn congestion_state(&self) -> Box<dyn Controller> {
-        self.0
+        self.conn
             .state
             .lock("congestion_state")
             .inner
@@ -453,7 +463,7 @@ impl Connection {
     ///
     /// [`Connection::handshake_data()`]: crate::Connecting::handshake_data
     pub fn handshake_data(&self) -> Option<Box<dyn Any>> {
-        self.0
+        self.conn
             .state
             .lock("handshake_data")
             .inner
@@ -467,7 +477,7 @@ impl Connection {
     /// [`Session`](proto::crypto::Session). For the default `rustls` session, the return value can
     /// be [`downcast`](Box::downcast) to a <code>Vec<[rustls::Certificate](rustls::Certificate)></code>
     pub fn peer_identity(&self) -> Option<Box<dyn Any>> {
-        self.0
+        self.conn
             .state
             .lock("peer_identity")
             .inner
@@ -480,13 +490,13 @@ impl Connection {
     /// Peer addresses and connection IDs can change, but this value will remain
     /// fixed for the lifetime of the connection.
     pub fn stable_id(&self) -> usize {
-        self.0.stable_id()
+        self.conn.stable_id()
     }
 
     // Update traffic keys spontaneously for testing purposes.
     #[doc(hidden)]
     pub fn force_key_update(&self) {
-        self.0
+        self.conn
             .state
             .lock("force_key_update")
             .inner
@@ -507,7 +517,7 @@ impl Connection {
         label: &[u8],
         context: &[u8],
     ) -> Result<(), proto::crypto::ExportKeyingMaterialError> {
-        self.0
+        self.conn
             .state
             .lock("export_keying_material")
             .inner
@@ -520,7 +530,7 @@ impl Connection {
     /// No streams may be opened by the peer unless fewer than `count` are already open. Large
     /// `count`s increase both minimum and worst-case memory consumption.
     pub fn set_max_concurrent_uni_streams(&self, count: VarInt) {
-        let mut conn = self.0.state.lock("set_max_concurrent_uni_streams");
+        let mut conn = self.conn.state.lock("set_max_concurrent_uni_streams");
         conn.inner.set_max_concurrent_streams(Dir::Uni, count);
         // May need to send MAX_STREAMS to make progress
         conn.wake();
@@ -528,7 +538,7 @@ impl Connection {
 
     /// See [`proto::TransportConfig::receive_window()`]
     pub fn set_receive_window(&self, receive_window: VarInt) {
-        let mut conn = self.0.state.lock("set_receive_window");
+        let mut conn = self.conn.state.lock("set_receive_window");
         conn.inner.set_receive_window(receive_window);
         conn.wake();
     }
@@ -538,7 +548,7 @@ impl Connection {
     /// No streams may be opened by the peer unless fewer than `count` are already open. Large
     /// `count`s increase both minimum and worst-case memory consumption.
     pub fn set_max_concurrent_bi_streams(&self, count: VarInt) {
-        let mut conn = self.0.state.lock("set_max_concurrent_bi_streams");
+        let mut conn = self.conn.state.lock("set_max_concurrent_bi_streams");
         conn.inner.set_max_concurrent_streams(Dir::Bi, count);
         // May need to send MAX_STREAMS to make progress
         conn.wake();
