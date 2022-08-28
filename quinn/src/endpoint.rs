@@ -12,18 +12,18 @@ use std::{
     time::Instant,
 };
 
-use crate::runtime::{default_runtime, AsyncUdpSocket, Runtime};
+use crate::runtime::{default_runtime, AsyncTimer, AsyncUdpSocket, Runtime};
 use bytes::{Bytes, BytesMut};
 use proto::{
     self as proto, ClientConfig, ConnectError, ConnectionHandle, DatagramEvent, ServerConfig,
 };
 use rustc_hash::FxHashMap;
 use tokio::sync::{mpsc, Notify};
-use tokio_util::time::DelayQueue;
 use udp::{RecvMeta, UdpState, BATCH_SIZE};
 
 use crate::{
     connection::{Connecting, ConnectionRef},
+    delay_queue::DelayQueue,
     poll_fn,
     work_limiter::WorkLimiter,
     EndpointConfig, VarInt, RECV_TIME_BOUND, SEND_TIME_BOUND,
@@ -121,6 +121,7 @@ impl Endpoint {
             socket,
             proto::Endpoint::new(Arc::new(config), server_config.map(Arc::new)),
             addr.is_ipv6(),
+            runtime.clone(),
         );
         let driver = EndpointDriver(rc.clone());
         runtime.spawn(Box::pin(async {
@@ -335,6 +336,7 @@ impl Drop for EndpointDriver {
 
 #[derive(Debug)]
 pub(crate) struct EndpointInner {
+    runtime: Arc<dyn Runtime>,
     socket: Box<dyn AsyncUdpSocket>,
     udp_state: UdpState,
     inner: proto::Endpoint,
@@ -360,6 +362,8 @@ pub(crate) struct EndpointInner {
     timers: DelayQueue<ConnectionHandle>,
     /// Temporary buffer for connections dirty before a poll pass
     dirty_buffer: Vec<ConnectionHandle>,
+    timer_epoch: Instant,
+    base_timer: Option<Pin<Box<dyn AsyncTimer>>>,
 }
 
 impl EndpointInner {
@@ -430,9 +434,17 @@ impl EndpointInner {
         Ok(false)
     }
 
-    fn drive_timers(&mut self, cx: &mut Context, now: Instant) {
-        while let Poll::Ready(Some(result)) = self.timers.poll_expired(cx) {
-            let conn_handle = result.unwrap().into_inner();
+    fn drive_timers(&mut self, cx: &mut Context, now: Instant) -> bool {
+        let mut keep_going = false;
+        // `DelayQueue::poll` currently yields timers expiring in the same millisecond in LIFO
+        // order. This doesn't matter so long as we're processing all expiries, but if the below
+        // loop is ever updated to bail out early to improve fairness under heavy load, then we
+        // should carefully consider whether serving newer events (more likely to still be relevant)
+        // or older ones (more likely to allow us to free resources) should take priority.
+        while let Some(conn_handle) = self
+            .timers
+            .poll((now - self.timer_epoch).as_millis() as u64)
+        {
             let conn = match self.connections.refs.get(&conn_handle) {
                 Some(c) => c,
                 None => continue,
@@ -444,6 +456,20 @@ impl EndpointInner {
             state.timer_deadline = None;
             state.wake();
         }
+        if let Some(deadline) = self.timers.next_timeout() {
+            let deadline = self.timer_epoch + std::time::Duration::from_millis(deadline);
+            let timer = match self.base_timer {
+                Some(ref mut x) => {
+                    x.as_mut().reset(deadline);
+                    x
+                }
+                None => self.base_timer.insert(self.runtime.new_timer(deadline)),
+            };
+            if let Poll::Ready(()) = timer.as_mut().poll(cx) {
+                keep_going = true;
+            }
+        }
+        keep_going
     }
 
     fn drive_send(&mut self, cx: &mut Context) -> Result<bool, io::Error> {
@@ -493,7 +519,7 @@ impl EndpointInner {
     fn drive_connections(&mut self, cx: &mut Context) -> bool {
         let mut keep_going = false;
 
-        self.drive_timers(cx, Instant::now());
+        keep_going |= self.drive_timers(cx, Instant::now());
 
         // Buffer the list of initially dirty connections, guaranteeing that the connection
         // processing loop below takes a predictable amount of time.
@@ -513,15 +539,17 @@ impl EndpointInner {
             let _guard = state.span.clone().entered();
             let mut keep_conn_going = state.drive_transmit(&mut self.outgoing, max_datagrams);
             if let Some(deadline) = state.inner.poll_timeout() {
-                let deadline = tokio::time::Instant::from(deadline);
                 if Some(deadline) != state.timer_deadline {
+                    let deadline = (deadline - self.timer_epoch).as_millis() as u64;
                     match state.timer_handle {
-                        Some(ref key) => self.timers.reset_at(key, deadline),
+                        Some(key) => {
+                            self.timers.reset(key, deadline);
+                        }
                         None => {
-                            state.timer_handle = Some(self.timers.insert_at(conn_handle, deadline));
+                            state.timer_handle = Some(self.timers.insert(deadline, conn_handle));
                         }
                     }
-                    // self.timers may need to be polled
+                    // base timer may need to be updated
                     keep_going = true;
                 }
             }
@@ -640,7 +668,12 @@ impl Drop for Incoming {
 pub(crate) struct EndpointRef(Arc<Mutex<EndpointInner>>);
 
 impl EndpointRef {
-    pub(crate) fn new(socket: Box<dyn AsyncUdpSocket>, inner: proto::Endpoint, ipv6: bool) -> Self {
+    pub(crate) fn new(
+        socket: Box<dyn AsyncUdpSocket>,
+        inner: proto::Endpoint,
+        ipv6: bool,
+        runtime: Arc<dyn Runtime>,
+    ) -> Self {
         let udp_state = UdpState::new();
         let recv_buf = vec![
             0;
@@ -650,6 +683,7 @@ impl EndpointRef {
         ];
         let (dirty_send, dirty_recv) = mpsc::unbounded_channel();
         Self(Arc::new(Mutex::new(EndpointInner {
+            runtime,
             socket,
             udp_state,
             inner,
@@ -672,6 +706,8 @@ impl EndpointRef {
             dirty_send,
             timers: DelayQueue::new(),
             dirty_buffer: Vec::new(),
+            timer_epoch: Instant::now(),
+            base_timer: None,
         })))
     }
 }
