@@ -44,16 +44,35 @@ async fn main() {
 
 async fn run(opt: Opt) -> Result<()> {
     let (key, cert) = match (&opt.key, &opt.cert) {
-        (&Some(ref key), &Some(ref cert)) => {
-            let key = fs::read(key).context("reading key")?;
+        (&Some(ref key_path), &Some(ref cert)) => {
+            let key = fs::read(key_path).context("reading key")?;
             let cert = fs::read(cert).expect("reading cert");
 
             let mut certs = Vec::new();
             for cert in rustls_pemfile::certs(&mut cert.as_ref()).context("parsing cert")? {
                 certs.push(rustls::Certificate(cert));
             }
+            let key = if key_path.extension().map_or(false, |x| x == "der") {
+                rustls::PrivateKey(key)
+            } else {
+                let pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut &*key)
+                    .context("malformed PKCS #8 private key")?;
+                match pkcs8.into_iter().next() {
+                    Some(x) => rustls::PrivateKey(x),
+                    None => {
+                        let rsa = rustls_pemfile::rsa_private_keys(&mut &*key)
+                            .context("malformed PKCS #1 private key")?;
+                        match rsa.into_iter().next() {
+                            Some(x) => rustls::PrivateKey(x),
+                            None => {
+                                anyhow::bail!("no private keys found");
+                            }
+                        }
+                    }
+                }
+            };
 
-            (rustls::PrivateKey(key), certs)
+            (key, certs)
         }
         _ => {
             let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
